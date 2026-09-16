@@ -1,172 +1,153 @@
 import json
 import os
-import psutil
-import win32gui
-import win32con
-import win32process
 import subprocess
+import psutil
 import sherpa_onnx
-import winsound
 import sounddevice as sd
 from rapidfuzz import process, fuzz
+import ctypes
+import sentencepiece as spm
+import urllib.request
+
+def close_program(path):
+    exe_name = os.path.basename(path)
+    subprocess.run(["taskkill", "/IM", exe_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+def terminate_program(path):
+    exe_name = os.path.basename(path)
+    subprocess.run(["taskkill", "/F", "/IM", exe_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+def handle_command(text):
+    global last_program
+
+    words = text.split()
+
+    command = None
+    command_index = -1
+
+    for i in range(len(words)):
+        if fuzz.ratio(words[i], "open") >= 75:
+            command = "open"
+            command_index = i
+
+        elif fuzz.ratio(words[i], "close") >= 75:
+            command = "close"
+            command_index = i
+
+        elif fuzz.ratio(words[i], "terminate") >= 75:
+            command = "terminate"
+            command_index = i
+
+    if command is None:
+        return False
+
+    program_name = " ".join(words[command_index + 1:])
+
+    if not program_name:
+        return False
+
+    match = process.extractOne(program_name, programs.keys(), scorer=fuzz.ratio, score_cutoff=65)
+
+    if not match:
+        return False
+
+    path = programs[match[0]]
+    last_program = match[0]
+
+    if command == "open":
+        subprocess.Popen([path])
+
+    elif command == "close":
+        close_program(path)
+
+    elif command == "terminate":
+        terminate_program(path)
+
+    return True
 
 
-logo = """ █████ █████   █████ █████
-▒▒███ ▒▒███   ▒▒███ ▒▒███
- ▒███  ▒███    ▒███  ▒███
- ▒███  ▒███    ▒███  ▒███
- ▒███  ▒▒███   ███   ▒███
- ▒███   ▒▒▒█████▒    ▒███
- █████    ▒▒███      █████
-▒▒▒▒▒      ▒▒▒      ▒▒▒▒▒
+programs = json.load(open("data/programs.json", encoding="utf-8"))
+last_program = ""
 
-"""
+def build_prompt():
+    return open("ttt model/prompt.txt", encoding="utf-8").read().replace("{PROGRAMS}", "\n".join(programs.keys())).replace("{LAST_PROGRAM}", last_program)
 
 
-def print_config(text=""):
-    os.system("cls")
-    print(logo)
-    print(f"You say: {text}", flush=True)
+def normalize_text(text):
+    words = text.split()
 
-
-def open_program(path):
-    exe = os.path.basename(path).lower()
-
-    for app in psutil.process_iter(["pid", "name"]):
-        name = app.info["name"]
-
-        if not name or name.lower() != exe:
-            continue
-
-        windows = []
-
-        def find_window(hwnd, _):
-            pid = win32process.GetWindowThreadProcessId(hwnd)[1]
-
-            if win32gui.IsWindowVisible(hwnd) and pid == app.info["pid"]:
-                windows.append(hwnd)
-
-        win32gui.EnumWindows(find_window, None)
-
-        if windows:
-            window = windows[0]
-
-            win32gui.ShowWindow(window, win32con.SW_RESTORE)
-            win32gui.SetForegroundWindow(window)
-
-            return
-
-    subprocess.Popen([path])
-
-
-def find_command(words):
-    for i in range(len(words) - 1, -1, -1):
-        match = process.extractOne(
-            words[i],
-            ["open", "close", "exit"],
-            scorer=fuzz.ratio,
-            score_cutoff=75
-        )
-
+    for i in range(len(words)):
+        match = process.extractOne(words[i], ["open", "close", "terminate"] + list(programs.keys()), scorer=fuzz.ratio, score_cutoff=75)
         if match:
-            return match[0], words[i:]
+            words[i] = match[0]
 
-    return None, words
-
-
-def reset_recognition():
-    print_config()
-    return recognizer.create_stream(), ""
+    return " ".join(words)
 
 
-programs = json.load(
-    open("data/programs.json", encoding="utf-8")
-)
+hotwords = list(programs.keys()) + ["cactus", "open", "close", "terminate", "exit"]
+with open("stt model/hotwords.txt", "w", encoding="utf-8") as h:
+    h.write("\n".join(hotwords))
 
 
-recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(
-    tokens="stt model/tokens.txt",
-    encoder="stt model/encoder.onnx",
-    decoder="stt model/decoder.onnx",
-    joiner="stt model/joiner.onnx",
-    num_threads=2,
-    sample_rate=16000,
-    feature_dim=80,
-    decoding_method="greedy_search",
-    provider="cpu"
-)
+recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(tokens="stt model/tokens.txt", encoder="stt model/encoder.onnx", decoder="stt model/decoder.onnx", joiner="stt model/joiner.onnx", bpe_vocab="stt model/bpe.vocab", hotwords_file="stt model/hotwords.txt", hotwords_score=2, num_threads=1, sample_rate=16000, feature_dim=80, enable_endpoint_detection=True, rule1_min_trailing_silence=2, rule2_min_trailing_silence=1, rule3_min_utterance_length=999999, decoding_method="modified_beam_search", max_active_paths=10, modeling_unit="bpe", provider="cpu")
 
+Engine = "vulkan"
+server = subprocess.Popen([f"ttt engine/{Engine.lower()}/llama-server.exe", "-m", "ttt model/ai.gguf", "-c", "512", "-n", "100", "-t", "8", *(["-ngl", "all"] if Engine.lower() == "vulkan" else []), "--keep", "-1", "-fa", "on", "--reasoning", "off", "--alias", "ai", "--host", "127.0.0.1", "--port", "2222"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 stream = recognizer.create_stream()
-last = ""
+last_text = ""
+cactus_mode = False
 
-
-os.system("title IVI Config")
-
-print_config()
-
-winsound.PlaySound(
-    "data/sounds/launch.wav",
-    winsound.SND_FILENAME | winsound.SND_ASYNC
-)
-
-
-with sd.InputStream(
-    channels=1,
-    dtype="float32",
-    samplerate=16000,
-    blocksize=320,
-    latency="low"
-) as mic:
+print("Cactus V2")
+with sd.InputStream(channels=1, dtype="float32", samplerate=16000, blocksize=300, latency="low") as mic:
 
     while True:
-        audio, _ = mic.read(320)
-
-        stream.accept_waveform(
-            16000,
-            audio.reshape(-1)
-        )
+        audio, _ = mic.read(300)
+        stream.accept_waveform(16000, audio.reshape(-1))
 
         while recognizer.is_ready(stream):
             recognizer.decode_stream(stream)
 
-        text = recognizer.get_result(stream).lower().strip()
+        text = normalize_text(recognizer.get_result(stream).lower().strip())
 
-        if text != last:
-            last = text
-            words = text.split()
-
-            if words:
-                command, words = find_command(words)
-
-                print_config(text)
-
-                if command == "exit":
+        if text:
+            for i in range(len(text.split())):
+                if fuzz.ratio(text.split()[i], "cactus") >= 75:
+                    cactus_mode = True
+                    text = " ".join(text.split()[i + 1:])
                     break
 
-                if command in ["open", "close"] and len(words) > 1:
-                    name = " ".join(words[1:])
+        if cactus_mode:
+            if recognizer.is_endpoint(stream):
+                print("STT:",text)
+                request = urllib.request.Request("http://127.0.0.1:2222/v1/chat/completions", data=json.dumps({"model": "ai", "messages": [{"role": "system", "content": build_prompt()}, {"role": "user", "content": text}], "max_tokens": 30, "temperature": 0}).encode(), headers={"Content-Type": "application/json"})
+                data = json.loads(urllib.request.urlopen(request).read())
+                answer = data["choices"][0]["message"]["content"].lower().strip()
 
-                    match = process.extractOne(
-                        name,
-                        programs.keys(),
-                        scorer=fuzz.ratio,
-                        score_cutoff=65
-                    )
+                print("TTT:", answer)
+                handle_command(answer)
+                cactus_mode = False
+                stream = recognizer.create_stream()
+                last_text = ""
+            continue
 
-                    if match:
-                        path = programs[match[0]]
+        if not text:
+            continue
 
-                        if command == "open":
-                            open_program(path)
+        if text == last_text:
+            continue
 
-                        else:
-                            exe = os.path.basename(path).lower()
+        last_text = text
+        print("STT:",text)
 
-                            for app in psutil.process_iter(["name"]):
-                                app_name = app.info["name"]
+        words = text.split()
 
-                                if app_name and app_name.lower() == exe:
-                                    app.kill()
+        for word in words:
+            if fuzz.ratio(word, "exit") >= 80:
+                server.kill()
+                server.wait()
+                exit()
 
-                        stream, last = reset_recognition()
+        if handle_command(text):
+            stream = recognizer.create_stream()
+            last_text = ""
