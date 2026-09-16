@@ -1,5 +1,5 @@
 psutil
-pywin32
 sherpa-onnx
 sounddevice
 rapidfuzz
+sentencepiece
